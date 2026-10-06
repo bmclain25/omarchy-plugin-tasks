@@ -1,0 +1,12 @@
+# Sensitive credentials & tokens (NEVER COMMIT)
+credentials.json
+token.json
+cache.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store
+Thumbs.db

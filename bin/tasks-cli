@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+"""Google Tasks CLI & MCP Server for Omarchy Linux Desktop."""
+
+import argparse
+import datetime
+import http.server
+import json
+import os
+import socketserver
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+
+CONFIG_DIR = os.path.expanduser("~/.config/omarchy/google-tasks")
+CREDENTIALS_FILE = os.path.join(CONFIG_DIR, "credentials.json")
+TOKEN_FILE = os.path.join(CONFIG_DIR, "token.json")
+CACHE_FILE = os.path.join(CONFIG_DIR, "cache.json")
+
+AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+TASKS_API_BASE = "https://tasks.googleapis.com/tasks/v1"
+SCOPES = "https://www.googleapis.com/auth/tasks"
+DEFAULT_PORT = 8088
+
+
+def get_credentials():
+    if not os.path.exists(CREDENTIALS_FILE):
+        return None
+    try:
+        with open(CREDENTIALS_FILE, "r") as f:
+            creds = json.load(f)
+            if creds.get("client_id") and creds.get("client_secret"):
+                return creds
+    except Exception:
+        pass
+    return None
+
+
+def get_stored_tokens():
+    if not os.path.exists(TOKEN_FILE):
+        return None
+    try:
+        with open(TOKEN_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_tokens(tokens):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(TOKEN_FILE, "w") as f:
+        json.dump(tokens, f, indent=2)
+
+
+def get_cached_tasks():
+    if not os.path.exists(CACHE_FILE):
+        return None
+    try:
+        with open(CACHE_FILE, "r") as f:
+            data = json.load(f)
+            return data
+    except Exception:
+        return None
+
+
+def save_cached_tasks(tasks):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CACHE_FILE, "w") as f:
+        json.dump({"tasks": tasks, "cached_at": time.time()}, f, indent=2)
+
+
+def get_valid_access_token():
+    tokens = get_stored_tokens()
+    if not tokens:
+        return None
+
+    now = time.time()
+    expires_at = tokens.get("expires_at", 0)
+
+    if tokens.get("access_token") and now < (expires_at - 60):
+        return tokens["access_token"]
+
+    refresh_token = tokens.get("refresh_token")
+    if not refresh_token:
+        return None
+
+    creds = get_credentials()
+    if not creds:
+        return None
+    data = urllib.parse.urlencode({
+        "client_id": creds["client_id"],
+        "client_secret": creds["client_secret"],
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token"
+    }).encode("utf-8")
+
+    req = urllib.request.Request(TOKEN_ENDPOINT, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            new_tokens = json.loads(resp.read().decode("utf-8"))
+            tokens["access_token"] = new_tokens["access_token"]
+            tokens["expires_at"] = now + new_tokens.get("expires_in", 3600)
+            if "refresh_token" in new_tokens:
+                tokens["refresh_token"] = new_tokens["refresh_token"]
+            save_tokens(tokens)
+            return tokens["access_token"]
+    except Exception as e:
+        sys.stderr.write(f"Error refreshing token: {e}\n")
+        return None
+
+
+def setup_credentials(client_id=None, client_secret=None):
+    if not client_id:
+        client_id = input("Enter Google Client ID: ").strip()
+    if not client_secret:
+        client_secret = input("Enter Google Client Secret: ").strip()
+    if not client_id or not client_secret:
+        print("Error: Both Client ID and Client Secret are required.", file=sys.stderr)
+        return False
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CREDENTIALS_FILE, "w") as f:
+        json.dump({"client_id": client_id, "client_secret": client_secret}, f, indent=2)
+    print("Credentials saved successfully to", CREDENTIALS_FILE)
+    return True
+
+
+def build_auth_url(port=DEFAULT_PORT):
+    creds = get_credentials()
+    if not creds:
+        raise RuntimeError("Missing Google OAuth credentials. Run `tasks-cli setup` first.")
+    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    params = {
+        "client_id": creds["client_id"],
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": SCOPES,
+        "access_type": "offline",
+        "prompt": "consent"
+    }
+    return f"{AUTH_ENDPOINT}?{urllib.parse.urlencode(params)}", redirect_uri
+
+
+def start_auth_server(port=DEFAULT_PORT, open_browser=True):
+    creds = get_credentials()
+    if not creds:
+        return {"success": False, "error": "Missing Google OAuth credentials. Run `tasks-cli setup` first."}
+    auth_url, redirect_uri = build_auth_url(port)
+    creds = get_credentials()
+    result = {"code": None, "error": None}
+
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/callback":
+                qs = urllib.parse.parse_qs(parsed.query)
+                if "code" in qs:
+                    result["code"] = qs["code"][0]
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    html = """<!DOCTYPE html>
+<html>
+<head><title>Google Tasks Connected</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         display: flex; align-items: center; justify-content: center; height: 100vh;
+         background: #181825; color: #cdd6f4; margin: 0; }
+  .card { background: #1e1e2e; border: 1px solid #313244; border-radius: 12px;
+          padding: 32px 48px; text-align: center; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
+  h1 { color: #a6e3a1; margin-bottom: 8px; font-size: 24px; }
+  p { color: #a6adc8; font-size: 15px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>✓ Authentication Successful!</h1>
+    <p>Your Google Tasks are now connected to Omarchy.</p>
+    <p>You may safely close this browser window and return to your desktop.</p>
+  </div>
+</body>
+</html>"""
+                    self.wfile.write(html.encode("utf-8"))
+                else:
+                    error_msg = qs.get("error", ["Unknown error"])[0]
+                    result["error"] = error_msg
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(f"Authentication failed: {error_msg}".encode("utf-8"))
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    server = socketserver.TCPServer(("127.0.0.1", port), CallbackHandler)
+    server.timeout = 180
+
+    print(f"Opening authentication URL: {auth_url}", file=sys.stderr)
+    if open_browser:
+        try:
+            webbrowser.open(auth_url)
+        except Exception:
+            pass
+
+    # Wait for the single callback request
+    while result["code"] is None and result["error"] is None:
+        server.handle_request()
+        if result["code"] or result["error"]:
+            break
+
+    server.server_close()
+
+    if result["code"]:
+        # Exchange code for tokens
+        post_data = urllib.parse.urlencode({
+            "code": result["code"],
+            "client_id": creds["client_id"],
+            "client_secret": creds["client_secret"],
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code"
+        }).encode("utf-8")
+
+        req = urllib.request.Request(TOKEN_ENDPOINT, data=post_data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                token_resp = json.loads(resp.read().decode("utf-8"))
+                tokens = {
+                    "access_token": token_resp["access_token"],
+                    "refresh_token": token_resp.get("refresh_token"),
+                    "expires_at": time.time() + token_resp.get("expires_in", 3600)
+                }
+                save_tokens(tokens)
+                # Fetch tasks into cache
+                fetch_and_cache_tasks()
+                return {"success": True, "message": "Successfully authenticated with Google Tasks"}
+        except Exception as e:
+            return {"success": False, "error": f"Failed to exchange code: {e}"}
+    else:
+        return {"success": False, "error": result["error"] or "Timeout waiting for authentication"}
+
+
+def api_request(method, endpoint, body=None, params=None):
+    token = get_valid_access_token()
+    if not token:
+        raise RuntimeError("Not authenticated. Please run auth first.")
+
+    url = f"{TASKS_API_BASE}{endpoint}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            content = resp.read().decode("utf-8")
+            if content:
+                return json.loads(content)
+            return {}
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Google API Error {e.code}: {err_msg}")
+
+
+def normalize_task(item):
+    due_raw = item.get("due")
+    due_date = None
+    if due_raw:
+        # RFC 3339 format: YYYY-MM-DD...
+        due_date = due_raw.split("T")[0]
+
+    return {
+        "id": item.get("id"),
+        "title": item.get("title", ""),
+        "notes": item.get("notes", ""),
+        "status": item.get("status", "needsAction"),
+        "completed": item.get("status") == "completed",
+        "due": due_date,
+        "due_raw": due_raw,
+        "updated": item.get("updated")
+    }
+
+
+def fetch_and_cache_tasks():
+    try:
+        # Default task list tasks
+        data = api_request("GET", "/lists/@default/tasks", params={"showCompleted": "true", "showHidden": "true", "maxResults": "100"})
+        items = data.get("items", [])
+        normalized = [normalize_task(t) for t in items if not t.get("deleted", False)]
+        save_cached_tasks(normalized)
+        return normalized
+    except Exception as e:
+        sys.stderr.write(f"Error fetching tasks: {e}\n")
+        cached = get_cached_tasks()
+        return cached.get("tasks", []) if cached else []
+
+
+def list_tasks(refresh=False):
+    cached = get_cached_tasks()
+    if not refresh and cached and (time.time() - cached.get("cached_at", 0) < 60):
+        return cached.get("tasks", [])
+    return fetch_and_cache_tasks()
+
+
+def add_task(title, notes=None, due=None):
+    body = {"title": title}
+    if notes:
+        body["notes"] = notes
+    if due:
+        # Must be formatted as YYYY-MM-DDT00:00:00.000Z
+        body["due"] = f"{due}T00:00:00.000Z"
+
+    resp = api_request("POST", "/lists/@default/tasks", body=body)
+    new_task = normalize_task(resp)
+
+    # Update cache
+    cached = get_cached_tasks()
+    tasks = cached.get("tasks", []) if cached else []
+    tasks.insert(0, new_task)
+    save_cached_tasks(tasks)
+
+    return new_task
+
+
+def update_task(task_id, title=None, notes=None, due=None, clear_due=False, status=None):
+    body = {}
+    if title is not None:
+        body["title"] = title
+    if notes is not None:
+        body["notes"] = notes
+    if clear_due:
+        body["due"] = None
+    elif due is not None:
+        body["due"] = f"{due}T00:00:00.000Z"
+    if status is not None:
+        body["status"] = status
+        if status == "needsAction":
+            body["completed"] = None
+
+    resp = api_request("PATCH", f"/lists/@default/tasks/{task_id}", body=body)
+    updated = normalize_task(resp)
+
+    # Update cache
+    cached = get_cached_tasks()
+    if cached:
+        tasks = cached.get("tasks", [])
+        for i, t in enumerate(tasks):
+            if t["id"] == task_id:
+                tasks[i] = updated
+                break
+        save_cached_tasks(tasks)
+
+    return updated
+
+
+def toggle_task(task_id):
+    cached = get_cached_tasks()
+    current_status = "needsAction"
+    if cached:
+        for t in cached.get("tasks", []):
+            if t["id"] == task_id:
+                current_status = t.get("status", "needsAction")
+                break
+
+    new_status = "completed" if current_status == "needsAction" else "needsAction"
+    return update_task(task_id, status=new_status)
+
+
+def delete_task(task_id):
+    api_request("DELETE", f"/lists/@default/tasks/{task_id}")
+    cached = get_cached_tasks()
+    if cached:
+        tasks = [t for t in cached.get("tasks", []) if t["id"] != task_id]
+        save_cached_tasks(tasks)
+    return {"success": True, "id": task_id}
+
+
+# ==========================================
+# MCP SERVER IMPLEMENTATION (STDIO JSON-RPC)
+# ==========================================
+
+def run_mcp_server():
+    """Implements Model Context Protocol over stdio for Google Tasks."""
+    tools_list = [
+        {
+            "name": "google_tasks_list",
+            "description": "List tasks from Google Tasks, including completion status and due dates.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "refresh": {"type": "boolean", "description": "Force refresh from Google Tasks API"}
+                }
+            }
+        },
+        {
+            "name": "google_tasks_add",
+            "description": "Create a new task in Google Tasks with optional notes and due date.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Task title"},
+                    "notes": {"type": "string", "description": "Optional details or notes"},
+                    "due": {"type": "string", "description": "Due date in YYYY-MM-DD format"}
+                },
+                "required": ["title"]
+            }
+        },
+        {
+            "name": "google_tasks_update",
+            "description": "Update an existing task in Google Tasks (title, notes, due date, or status).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "The Google Tasks ID"},
+                    "title": {"type": "string", "description": "Updated title"},
+                    "notes": {"type": "string", "description": "Updated notes"},
+                    "due": {"type": "string", "description": "Updated due date in YYYY-MM-DD format"},
+                    "clear_due": {"type": "boolean", "description": "Set true to remove due date"},
+                    "status": {"type": "string", "enum": ["needsAction", "completed"], "description": "Task status"}
+                },
+                "required": ["task_id"]
+            }
+        },
+        {
+            "name": "google_tasks_toggle",
+            "description": "Toggle a task between complete and incomplete.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "The task ID to toggle"}
+                },
+                "required": ["task_id"]
+            }
+        },
+        {
+            "name": "google_tasks_delete",
+            "description": "Delete a task from Google Tasks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "The task ID to delete"}
+                },
+                "required": ["task_id"]
+            }
+        },
+        {
+            "name": "google_tasks_status",
+            "description": "Check authentication status with Google Tasks.",
+            "inputSchema": {"type": "object", "properties": {}}
+        }
+    ]
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception:
+            continue
+
+        req_id = req.get("id")
+        method = req.get("method")
+        params = req.get("params", {})
+
+        if method == "initialize":
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "serverInfo": {"name": "google-tasks-mcp", "version": "1.0.0"},
+                    "capabilities": {"tools": {}}
+                }
+            }
+        elif method == "tools/list":
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"tools": tools_list}
+            }
+        elif method == "tools/call":
+            tool_name = params.get("name")
+            args = params.get("arguments", {})
+            try:
+                if tool_name == "google_tasks_list":
+                    res = list_tasks(refresh=args.get("refresh", False))
+                elif tool_name == "google_tasks_add":
+                    res = add_task(title=args["title"], notes=args.get("notes"), due=args.get("due"))
+                elif tool_name == "google_tasks_update":
+                    res = update_task(
+                        task_id=args["task_id"],
+                        title=args.get("title"),
+                        notes=args.get("notes"),
+                        due=args.get("due"),
+                        clear_due=args.get("clear_due", False),
+                        status=args.get("status")
+                    )
+                elif tool_name == "google_tasks_toggle":
+                    res = toggle_task(args["task_id"])
+                elif tool_name == "google_tasks_delete":
+                    res = delete_task(args["task_id"])
+                elif tool_name == "google_tasks_status":
+                    token = get_valid_access_token()
+                    res = {"authenticated": token is not None}
+                else:
+                    raise ValueError(f"Unknown tool: {tool_name}")
+
+                resp = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(res, indent=2)}]
+                    }
+                }
+            except Exception as e:
+                resp = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [{"type": "text", "text": f"Error: {e}"}],
+                        "isError": True
+                    }
+                }
+        else:
+            resp = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"}
+            }
+
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Google Tasks CLI & Omarchy Backend")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # auth
+    auth_p = subparsers.add_parser("auth", help="Authenticate with Google Tasks via OAuth")
+    auth_p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    auth_p.add_argument("--no-open", action="store_true", help="Do not open browser automatically")
+
+    # auth-url
+    auth_url_p = subparsers.add_parser("auth-url", help="Print the OAuth authorization URL")
+    auth_url_p.add_argument("--port", type=int, default=DEFAULT_PORT)
+
+    # status
+    subparsers.add_parser("status", help="Check authentication and cache status")
+
+    # list
+    list_p = subparsers.add_parser("list", help="List tasks")
+    list_p.add_argument("--refresh", action="store_true", help="Force refresh from API")
+
+    # add
+    add_p = subparsers.add_parser("add", help="Add a task")
+    add_p.add_argument("--title", required=True)
+    add_p.add_argument("--notes", default="")
+    add_p.add_argument("--due", help="Due date in YYYY-MM-DD")
+
+    # update
+    up_p = subparsers.add_parser("update", help="Update a task")
+    up_p.add_argument("--id", required=True)
+    up_p.add_argument("--title")
+    up_p.add_argument("--notes")
+    up_p.add_argument("--due")
+    up_p.add_argument("--clear-due", action="store_true")
+    up_p.add_argument("--status", choices=["needsAction", "completed"])
+
+    # toggle
+    tog_p = subparsers.add_parser("toggle", help="Toggle completion of a task")
+    tog_p.add_argument("--id", required=True)
+
+    # delete
+    del_p = subparsers.add_parser("delete", help="Delete a task")
+    del_p.add_argument("--id", required=True)
+
+    # setup
+    setup_p = subparsers.add_parser("setup", help="Configure Google OAuth credentials")
+    setup_p.add_argument("--client-id", help="Google Cloud OAuth Client ID")
+    setup_p.add_argument("--client-secret", help="Google Cloud OAuth Client Secret")
+
+    # mcp
+    subparsers.add_parser("mcp", help="Run MCP stdio server")
+
+    args = parser.parse_args()
+
+    if args.command == "setup":
+        setup_credentials(client_id=args.client_id, client_secret=args.client_secret)
+    elif args.command == "auth":
+        res = start_auth_server(port=args.port, open_browser=not args.no_open)
+        print(json.dumps(res, indent=2))
+    elif args.command == "auth-url":
+        url, _ = build_auth_url(port=args.port)
+        print(url)
+    elif args.command == "status":
+        creds = get_credentials()
+        token = get_valid_access_token() if creds else None
+        cached = get_cached_tasks()
+        print(json.dumps({
+            "has_credentials": creds is not None,
+            "authenticated": token is not None,
+            "has_token_file": os.path.exists(TOKEN_FILE),
+            "tasks_count": len(cached.get("tasks", [])) if cached else 0
+        }, indent=2))
+    elif args.command == "list":
+        tasks = list_tasks(refresh=args.refresh)
+        print(json.dumps(tasks, indent=2))
+    elif args.command == "add":
+        task = add_task(title=args.title, notes=args.notes, due=args.due)
+        print(json.dumps(task, indent=2))
+    elif args.command == "update":
+        task = update_task(
+            task_id=args.id,
+            title=args.title,
+            notes=args.notes,
+            due=args.due,
+            clear_due=args.clear_due,
+            status=args.status
+        )
+        print(json.dumps(task, indent=2))
+    elif args.command == "toggle":
+        task = toggle_task(task_id=args.id)
+        print(json.dumps(task, indent=2))
+    elif args.command == "delete":
+        res = delete_task(task_id=args.id)
+        print(json.dumps(res, indent=2))
+    elif args.command == "mcp":
+        run_mcp_server()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

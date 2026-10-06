@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "bmclain.google-tasks",
+  "name": "Google Tasks",
+  "version": "1.0.0",
+  "author": "bmclain25",
+  "description": "Google Tasks bar widget and popout panel for Omarchy with calendar picker and MCP integration",
+  "repository": "https://github.com/bmclain25/omarchy-plugin-tasks",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Google Tasks",
+    "description": "View, complete, add and update Google Tasks with due dates and calendar picker",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "keybind": "SUPER + SHIFT + T"
+    }
+  }
+}
